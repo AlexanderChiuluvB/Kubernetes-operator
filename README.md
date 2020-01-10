@@ -157,8 +157,220 @@ operator-sdk generate k8s
 
 #### 实现业务逻辑
 
+具体是在相应的controller实现的,具体在appservice_controller.go,需要去更改的核心部分是Reconcile方法,核心是不断去watch资源的状态,然后根据状态不同去实现不同的操作逻辑,核心代码如下
+
+```
+func (r *ReconcileAppService) Reconcile(request reconcile.Request) (reconcile.Result, error) {
+	reqLogger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
+	reqLogger.Info("Reconciling AppService")
+
+	// Fetch the AppService instance
+	instance := &appv1.AppService{}
+	err := r.client.Get(context.TODO(), request.NamespacedName, instance)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// Request object not found, could have been deleted after reconcile request.
+			// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
+			// Return and don't requeue
+			return reconcile.Result{}, nil
+		}
+		// Error reading the object - requeue the request.
+		return reconcile.Result{}, err
+	}
+
+	if instance.DeletionTimestamp != nil {
+		return reconcile.Result{}, err
+	}
+
+	// 如果不存在，则创建关联资源
+	// 如果存在，判断是否需要更新
+	//   如果需要更新，则直接更新
+	//   如果不需要更新，则正常返回
+
+	deploy := &appsv1.Deployment{}
+	if err := r.client.Get(context.TODO(), request.NamespacedName, deploy); err != nil && errors.IsNotFound(err) {
+		// 创建关联资源
+		// 1. 创建 Deploy
+		deploy := resources.NewDeploy(instance)
+		if err := r.client.Create(context.TODO(), deploy); err != nil {
+			return reconcile.Result{}, err
+		}
+		// 2. 创建 Service
+		service := resources.NewService(instance)
+		if err := r.client.Create(context.TODO(), service); err != nil {
+			return reconcile.Result{}, err
+		}
+		// 3. 关联 Annotations
+		data, _ := json.Marshal(instance.Spec)
+		if instance.Annotations != nil {
+			instance.Annotations["spec"] = string(data)
+		} else {
+			instance.Annotations = map[string]string{"spec": string(data)}
+		}
+
+		if err := r.client.Update(context.TODO(), instance); err != nil {
+			return reconcile.Result{}, nil
+		}
+		return reconcile.Result{}, nil
+	}
+
+	oldspec := appv1.AppServiceSpec{}
+	if err := json.Unmarshal([]byte(instance.Annotations["spec"]), oldspec); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if !reflect.DeepEqual(instance.Spec, oldspec) {
+		// 更新关联资源
+		newDeploy := resources.NewDeploy(instance)
+		oldDeploy := &appsv1.Deployment{}
+		if err := r.client.Get(context.TODO(), request.NamespacedName, oldDeploy); err != nil {
+			return reconcile.Result{}, err
+		}
+		oldDeploy.Spec = newDeploy.Spec
+		if err := r.client.Update(context.TODO(), oldDeploy); err != nil {
+			return reconcile.Result{}, err
+		}
+
+		newService := resources.NewService(instance)
+		oldService := &corev1.Service{}
+		if err := r.client.Get(context.TODO(), request.NamespacedName, oldService); err != nil {
+			return reconcile.Result{}, err
+		}
+		oldService.Spec = newService.Spec
+		if err := r.client.Update(context.TODO(), oldService); err != nil {
+			return reconcile.Result{}, err
+		}
+
+		return reconcile.Result{}, nil
+	}
+
+	return reconcile.Result{}, nil
+}
+
+```
+
+核心思想是先判断资源是否存在,如果不存在就直接创建新的Deployment和Service资源
+
+另外要在resources文件夹下实现NewDeploy和NewService方法,根据CRD的声明取填充Deployment和Service对象的Spec对象
 
 
+```
+func NewDeploy(app *appv1.AppService) *appsv1.Deployment {
+	labels := map[string]string{"app": app.Name}
+	selector := &metav1.LabelSelector{MatchLabels: labels}
+	return &appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "apps/v1",
+			Kind:       "Deployment",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      app.Name,
+			Namespace: app.Namespace,
+
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(app, schema.GroupVersionKind{
+					Group: v1.SchemeGroupVersion.Group,
+					Version: v1.SchemeGroupVersion.Version,
+					Kind: "AppService",
+				}),
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: app.Spec.Size,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+				},
+				Spec: corev1.PodSpec{
+					Containers: newContainers(app),
+				},
+			},
+			Selector: selector,
+		},
+	}
+}
+
+func newContainers(app *v1.AppService) []corev1.Container {
+	containerPorts := []corev1.ContainerPort{}
+	for _, svcPort := range app.Spec.Ports {
+		cport := corev1.ContainerPort{}
+		cport.ContainerPort = svcPort.TargetPort.IntVal
+		containerPorts = append(containerPorts, cport)
+	}
+	return []corev1.Container{
+		{
+			Name: app.Name,
+			Image: app.Spec.Image,
+			Resources: app.Spec.Resources,
+			Ports: containerPorts,
+			ImagePullPolicy: corev1.PullIfNotPresent,
+			Env: app.Spec.Envs,
+		},
+	}
+}
+
+```
+
+```
+func NewService(app *v1.AppService) *corev1.Service {
+	return &corev1.Service {
+		TypeMeta: metav1.TypeMeta {
+			Kind: "Service",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: app.Name,
+			Namespace: app.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(app, schema.GroupVersionKind{
+					Group: v1.SchemeGroupVersion.Group,
+					Version: v1.SchemeGroupVersion.Version,
+					Kind: "AppService",
+				}),
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeNodePort,
+			Ports: app.Spec.Ports,
+			Selector: map[string]string{
+				"app": app.Name,
+			},
+		},
+	}
+}
+```
+
+在集群中安装CRD对象
+
+```
+kubectl create -f deploy/crds/app_v1_appservice_crd.yaml
+```
+
+然后在本地项目中启动Operator进行调试
+
+```
+operator-sdk up local 
+```
+
+只要成功创建了crd,就可以添加这个自定义资源类型的资源了
+
+例如crd的名称是AppService,那么我们用`kubectl create -f cr.yaml` 来创建这个资源
+
+```
+apiVersion: app.example.com/v1
+kind: AppService
+metadata:
+  name: nginx-app
+spec:
+  size: 2
+  image: nginx:1.7.9
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 30002
+```
+
+创建完成后,就可以观察到其附带创建了service,deployment,pod这些关联的资源
 
 ### Ref
 [K8s入门教程](https://www.qikqiak.com/post/k8s-operator-101/)
