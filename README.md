@@ -90,6 +90,7 @@ sudo apt-get install go-dep
 
 1.
 ```
+mkdir -p operator-learning && cd operator-learning
 export GOPATH=$PWD 
 mkdir -p $GOPATH/src/github.com/alex
 cd $GOPATH/src/github.com/alex
@@ -97,7 +98,65 @@ operator-sdk new opdemo
 
 ```
 
-2.
+2.添加api
+
+```
+operator-sdk add api --api-version=app.example.com/v1 --kind=AppService
+```
+
+3.添加控制器
+
+```
+ operator-sdk add controller --api-version=app.example.com/v1 --kind=AppService
+```
+
+
+#### 自定义API
+
+打开源文件pkg/apis/app/v1/appservice_types.go,根据自定义资源所有的属性,定义相应的属性
+
+```
+import (
+    appsv1 "k8s.io/api/apps/v1"
+    corev1 "k8s.io/api/core/v1"
+    appv1 "github.com/cnych/opdemo/pkg/apis/app/v1"
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+type AppServiceSpec struct {
+	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
+	// Important: Run "operator-sdk generate k8s" to regenerate code after modifying this file
+	// Add custom validation using kubebuilder tags: https://book-v1.book.kubebuilder.io/beyond_basics/generating_crd.html
+	Size  	  *int32                      `json:"size"`
+	Image     string                      `json:"image"`
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+	Envs      []corev1.EnvVar             `json:"envs,omitempty"`
+	Ports     []corev1.ServicePort        `json:"ports,omitempty"`
+}
+```
+
+描述资源的状态
+
+```
+type AppServiceStatus struct {
+	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
+	// Important: Run "operator-sdk generate k8s" to regenerate code after modifying this file
+	// Add custom validation using kubebuilder tags: https://book.kubebuilder.io/beyond_basics/generating_crd.html
+	appsv1.DeploymentStatus `json:",inline"`
+}
+```
+
+定义完成后,在根目录下执行
+
+```
+operator-sdk generate k8s
+```
+
+这样就完成了对自定义资源对象的API声明
+
+
+#### 实现业务逻辑
+
 
 
 
